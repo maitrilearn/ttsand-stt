@@ -1,0 +1,13 @@
+version: '3'
+
+services:
+  voice-tutor:
+    build: .
+    container_name: maitrilearn-voice-tutor
+    ports:
+      - "5001:5001"
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    restart: unless-stopped
+    env_file:
+      - .env

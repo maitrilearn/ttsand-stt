@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: maitrilearn-voice-tutor
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: EDGE_TTS_VOICE
+        value: en-IN-NeerjaExpressiveNeural
+      - key: EDGE_TTS_RATE
+        value: +0%
+      - key: EDGE_TTS_PITCH
+        value: +0Hz
+      - key: PORT
+        value: 5001
