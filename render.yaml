@@ -6,6 +6,12 @@ services:
     envVars:
       - key: GROQ_API_KEY
         sync: false
+      # ── LLM fallback providers (llm_service.py) — same reasoning as the
+      # main backend: Groq's free tier alone isn't enough for real load.
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
       - key: EDGE_TTS_VOICE
         value: en-IN-NeerjaExpressiveNeural
       - key: EDGE_TTS_RATE
