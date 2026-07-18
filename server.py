@@ -119,52 +119,75 @@ matter how it's phrased.
 #         a clear error and the frontend (voiceTutor.js / whiteboard.html)
 #         falls back to the browser's own speechSynthesis, entirely client-side.
 #
-# Fix for reported bug: the frontend was getting the browser error "Failed to
-# load because no supported source was found" — meaning /audio/<filename>
-# returned HTTP 200 with mimetype audio/mpeg, but the underlying file wasn't
-# valid audio. Root cause: edge_tts talks to Microsoft's Read Aloud API over
-# a websocket, which intermittently returns empty/truncated audio when called
-# from cloud/datacenter IPs (common with Render/AWS/GCP) WITHOUT raising an
-# exception — so generate_speech() was returning a "successful" path to a
-# broken or empty file every time this happened. Changes:
-#   1. Validate the file actually has audio bytes after generation.
-#   2. Retry once on failure/empty-file before giving up, since these
-#      failures are typically transient.
-#   3. If Edge TTS still fails after retries, fall through to gTTS instead
-#      of failing the whole request — this is what fixes the "100% success
-#      response, 0% audio delivered" finding from the QA audit.
+# Retest findings (2026-07-18) and fixes applied:
+#   V-01 CRITICAL — every audio file 404'd. Root cause: _try_edge_tts() had a
+#     `finally: os.remove(f.name)` that ran unconditionally, including right
+#     after a successful `return f.name` — so the file was deleted a moment
+#     after being validated as good audio, before /audio/<filename> could
+#     ever serve it. Fixed by only deleting on the failure path.
+#   V-02 HIGH — the requested `voice` was silently ignored; the routes never
+#     read it from the request body, so every call used the hardcoded
+#     default. Fixed: voice is now read from the request, validated against
+#     ALLOWED_VOICES, and threaded through to the actual edge_tts call —
+#     the response's "voice" field now reflects what was truly used.
+#   V-03 MEDIUM — gTTS fallback was never observed to trigger, because
+#     edge_tts was actually succeeding at the network level (V-01 was a
+#     local file-lifecycle bug, not an edge_tts failure) — so Tier 1 never
+#     failed enough to fall through. The fallback path itself was already
+#     correct; no separate fix needed once V-01 is resolved.
 MIN_VALID_AUDIO_BYTES = 2000  # a few seconds of mp3 is always well above this
 
 class TTSGenerationError(Exception):
     pass
 
-async def _edge_tts(text: str, path: str):
+ALLOWED_VOICES = {
+    "en-IN-NeerjaExpressiveNeural",
+    "en-IN-NeerjaNeural",
+    "en-IN-PrabhatNeural",
+}
+
+def resolve_voice(requested: str) -> str:
+    """Only the 3 advertised Indian-English voices are allowed — silently
+    fall back to the default for anything else (typo, unsupported language,
+    empty string) rather than passing arbitrary values through to edge_tts."""
+    if requested and requested in ALLOWED_VOICES:
+        return requested
+    return VOICE
+
+async def _edge_tts(text: str, path: str, voice: str):
     communicate = edge_tts.Communicate(
-        text=text, voice=VOICE, rate=VOICE_RATE, pitch=VOICE_PITCH
+        text=text, voice=voice, rate=VOICE_RATE, pitch=VOICE_PITCH
     )
     await communicate.save(path)
 
-def _try_edge_tts(text: str, attempts: int = 2) -> str:
-    """Tier 1. Returns a filepath on success, raises TTSGenerationError on failure."""
+def _try_edge_tts(text: str, voice: str, attempts: int = 2) -> str:
+    """Tier 1. Returns a filepath on success, raises TTSGenerationError on failure.
+    IMPORTANT: on success, the caller (generate_speech -> route -> /audio/<file>)
+    is responsible for the file — it must NOT be deleted here. A prior bug
+    deleted the file unconditionally in a `finally` block immediately after
+    validating it, which meant /audio/<file> always 404'd (every file was
+    gone before it could ever be served). Cleanup of stale files instead
+    happens via cleanup_stale_audio(), called once per incoming request."""
     last_err = None
     for attempt in range(1, attempts + 1):
         f = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir="/tmp")
         f.close()
         try:
-            asyncio.run(_edge_tts(text, f.name))
+            asyncio.run(_edge_tts(text, f.name, voice))
             size = os.path.getsize(f.name)
             if size >= MIN_VALID_AUDIO_BYTES:
-                return f.name
+                return f.name  # success — leave the file in place, do not delete it
             last_err = f"edge_tts produced {size} bytes (expected a valid mp3) on attempt {attempt}"
             print(f"[tts:edge] {last_err}")
         except Exception as e:
             last_err = f"edge_tts raised on attempt {attempt}: {e}"
             print(f"[tts:edge] {last_err}")
-        finally:
-            try:
-                os.remove(f.name)
-            except OSError:
-                pass
+        # Only reached when this attempt failed (didn't return above) — clean
+        # up the bad/empty file before retrying or giving up.
+        try:
+            os.remove(f.name)
+        except OSError:
+            pass
     raise TTSGenerationError(f"edge_tts failed after {attempts} attempt(s): {last_err}")
 
 def _try_gtts(text: str) -> str:
@@ -189,28 +212,46 @@ def _try_gtts(text: str) -> str:
             pass
         raise TTSGenerationError(f"gTTS failed: {e}")
 
-def generate_speech(text: str, attempts: int = 2) -> tuple[str, str]:
+def generate_speech(text: str, voice: str = None, attempts: int = 2) -> tuple[str, str, str]:
     """
-    Returns (filepath, engine_used). engine_used is "edge" or "gtts".
+    Returns (filepath, engine_used, resolved_voice). engine_used is "edge" or "gtts".
     Raises TTSGenerationError only if BOTH server-side tiers fail — at that
     point the caller (route) returns an error and the frontend falls back
     to the browser's speechSynthesis (Tier 3, client-side only).
     """
+    resolved = resolve_voice(voice)
     try:
-        path = _try_edge_tts(text, attempts=attempts)
-        return path, "edge"
+        path = _try_edge_tts(text, resolved, attempts=attempts)
+        return path, "edge", resolved
     except TTSGenerationError as e:
         print(f"[tts] Tier 1 (edge_tts) exhausted, falling back to gTTS: {e}")
 
     try:
         path = _try_gtts(text)
-        return path, "gtts"
+        return path, "gtts", "gtts-en-IN"
     except TTSGenerationError as e:
         print(f"[tts] Tier 2 (gTTS) also failed: {e}")
 
     raise TTSGenerationError(
         "Both edge_tts and gTTS failed — client should fall back to browser speechSynthesis"
     )
+
+# ── Stale audio cleanup ───────────────────────────────────────────────────────
+# Files are no longer deleted right after generation (that was the V-01 bug),
+# so on an ephemeral /tmp they'll accumulate until the dyno restarts. Sweep
+# anything older than AUDIO_TTL_SECONDS at the start of each TTS request —
+# cheap, and avoids needing a background thread or cron on Render's free tier.
+AUDIO_TTL_SECONDS = 600  # 10 minutes is generous for a student to replay a clip
+
+def cleanup_stale_audio():
+    import glob, time
+    cutoff = time.time() - AUDIO_TTL_SECONDS
+    for path in glob.glob("/tmp/tmp*.mp3"):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
 
 def get_base_url() -> str:
     host   = request.headers.get("X-Forwarded-Host") or request.host
@@ -253,24 +294,28 @@ def tts_only():
     """
     TTS only — convert text to speech, no AI.
     Used by whiteboard narration (AI already generated text).
-    Body: { "text": "text to speak" }
+    Body: { "text": "text to speak", "voice": "en-IN-NeerjaNeural" (optional) }
+    Accepts "prompt" as an alias for "text" for API consistency with /generate.
     """
     data = request.get_json(silent=True) or {}
     try:
-        text = validate_text_input(data.get("text", ""))
+        text = validate_text_input(data.get("text") or data.get("prompt", ""))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    requested_voice = data.get("voice")
+    cleanup_stale_audio()
+
     try:
         clean = clean_for_tts(text)
-        path, engine = generate_speech(clean)
+        path, engine, resolved_voice = generate_speech(clean, voice=requested_voice)
         fname = os.path.basename(path)
         base  = get_base_url()
         return jsonify({
             "success":   True,
             "audio":     f"/audio/{fname}",
             "audio_url": f"{base}/audio/{fname}",
-            "voice":     VOICE if engine == "edge" else "gtts-en-IN",
+            "voice":     resolved_voice,  # the voice actually used — matches the request when valid
             "engine":    engine  # "edge" or "gtts" — lets the frontend log/telemetry which tier fired
         })
     except TTSGenerationError as e:
@@ -289,20 +334,24 @@ def generate():
     """
     Full pipeline — AI answer (Groq, falling back to Cerebras/Gemini) + TTS.
     Used by voice tutor feature.
-    Body: { "prompt": "student question" }
+    Body: { "prompt": "student question", "voice": "en-IN-NeerjaNeural" (optional) }
+    Accepts "text" as an alias for "prompt" for API consistency with /tts.
     """
     data = request.get_json(silent=True) or {}
     try:
-        prompt = validate_prompt(data.get("prompt", ""))
+        prompt = validate_prompt(data.get("prompt") or data.get("text", ""))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
+    requested_voice = data.get("voice")
+    cleanup_stale_audio()
 
     answer = None
     try:
         print(f"[generate] Prompt: {prompt[:80]}")
         answer = ask_teacher(prompt)
         clean  = clean_for_tts(answer)
-        path, engine = generate_speech(clean)
+        path, engine, resolved_voice = generate_speech(clean, voice=requested_voice)
         fname  = os.path.basename(path)
         base   = get_base_url()
 
@@ -311,7 +360,7 @@ def generate():
             "text":      answer,
             "audio":     f"/audio/{fname}",
             "audio_url": f"{base}/audio/{fname}",
-            "voice":     VOICE if engine == "edge" else "gtts-en-IN",
+            "voice":     resolved_voice,
             "engine":    engine
         })
     except TTSGenerationError as e:
@@ -336,7 +385,17 @@ def audio(filename):
     filename = os.path.basename(filename)
     filepath = f"/tmp/{filename}"
     if not os.path.exists(filepath):
-        return jsonify({"error": "Audio not found"}), 404
+        error = {"error": "Audio not found"}
+        # Verbose diagnostics only in debug mode — avoids leaking server
+        # filesystem layout to arbitrary callers in production.
+        if os.getenv("DEBUG"):
+            error["looked_in"] = filepath
+            error["ttl_seconds"] = AUDIO_TTL_SECONDS
+            error["hint"] = ("File may have expired (TTL cleanup runs on every "
+                              "/tts or /generate call) or was never written — "
+                              "check server logs for [tts:edge] / [tts] lines "
+                              "around the time this file was requested.")
+        return jsonify(error), 404
     with open(filepath, "rb") as f:
         data = f.read()
     # Defense in depth: generate_speech() already validates size before
