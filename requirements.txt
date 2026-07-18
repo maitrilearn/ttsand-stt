@@ -3,6 +3,5 @@ flask-cors==5.0.0
 flask-limiter==3.8.0
 requests==2.32.3
 python-dotenv==1.0.1
-edge-tts>=6.1.9,<7.0.0
 gunicorn
 edge-tts>=7.2.3
