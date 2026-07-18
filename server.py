@@ -110,17 +110,52 @@ matter how it's phrased.
     return ask_ai(wrapped, max_tokens=400)
 
 # ── Edge TTS ──────────────────────────────────────────────────────────────────
+# Fix for reported bug: the frontend was getting the browser error "Failed to
+# load because no supported source was found" — meaning /audio/<filename>
+# returned HTTP 200 with mimetype audio/mpeg, but the underlying file wasn't
+# valid audio. Root cause: edge_tts talks to Microsoft's Read Aloud API over
+# a websocket, which intermittently returns empty/truncated audio when called
+# from cloud/datacenter IPs (common with Render/AWS/GCP) WITHOUT raising an
+# exception — so generate_speech() was returning a "successful" path to a
+# broken or empty file every time this happened. Two changes:
+#   1. Validate the file actually has audio bytes after generation.
+#   2. Retry once on failure/empty-file before giving up, since these
+#      failures are typically transient.
+MIN_VALID_AUDIO_BYTES = 2000  # a few seconds of mp3 is always well above this
+
+class TTSGenerationError(Exception):
+    pass
+
 async def _tts(text: str, path: str):
     communicate = edge_tts.Communicate(
         text=text, voice=VOICE, rate=VOICE_RATE, pitch=VOICE_PITCH
     )
     await communicate.save(path)
 
-def generate_speech(text: str) -> str:
-    f = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir="/tmp")
-    f.close()
-    asyncio.run(_tts(text, f.name))
-    return f.name
+def generate_speech(text: str, attempts: int = 2) -> str:
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir="/tmp")
+        f.close()
+        try:
+            asyncio.run(_tts(text, f.name))
+            size = os.path.getsize(f.name)
+            if size >= MIN_VALID_AUDIO_BYTES:
+                return f.name
+            last_err = f"edge_tts produced {size} bytes (expected a valid mp3) on attempt {attempt}"
+            print(f"[tts] {last_err}")
+        except Exception as e:
+            last_err = f"edge_tts raised on attempt {attempt}: {e}"
+            print(f"[tts] {last_err}")
+        finally:
+            if attempt < attempts:
+                try:
+                    os.remove(f.name)
+                except OSError:
+                    pass
+    raise TTSGenerationError(
+        f"Speech generation failed after {attempts} attempt(s): {last_err}"
+    )
 
 def get_base_url() -> str:
     host   = request.headers.get("X-Forwarded-Host") or request.host
@@ -180,6 +215,9 @@ def tts_only():
             "audio_url": f"{base}/audio/{fname}",
             "voice":     VOICE
         })
+    except TTSGenerationError as e:
+        print(f"[tts] {e}")
+        return jsonify({"error": "Speech synthesis is temporarily unavailable, please try again"}), 503
     except Exception as e:
         print(f"[tts] Error: {e}")
         return jsonify({"error": str(e)}), 503
@@ -213,6 +251,13 @@ def generate():
             "audio_url": f"{base}/audio/{fname}",
             "voice":     VOICE
         })
+    except TTSGenerationError as e:
+        # AI answer succeeded but speech synthesis failed — still worth
+        # returning the text so the frontend isn't fully broken, with a
+        # distinct error code the frontend can use to fall back to
+        # text-only instead of trying (and failing) to play audio.
+        print(f"[generate] {e}")
+        return jsonify({"error": "tts_failed", "text": answer}), 503
     except Exception as e:
         print(f"[generate] Error: {e}")
         return jsonify({"error": str(e)}), 503
@@ -225,6 +270,12 @@ def audio(filename):
         return jsonify({"error": "Audio not found"}), 404
     with open(filepath, "rb") as f:
         data = f.read()
+    # Defense in depth: generate_speech() already validates size before
+    # returning, but if a file somehow slipped through (or is fetched twice
+    # after cleanup), don't return a 200 with unplayable bytes — that's what
+    # produced the browser's "no supported source" error for the caller.
+    if len(data) < MIN_VALID_AUDIO_BYTES:
+        return jsonify({"error": "Audio file is invalid or incomplete"}), 503
     return Response(
         data,
         mimetype="audio/mpeg",
